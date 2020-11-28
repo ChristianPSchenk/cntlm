@@ -1,0 +1,9 @@
+*.o
+config/config.h
+endian
+gethostname
+socklen_t
+strdup
+
+cntlm
+configure-stamp
