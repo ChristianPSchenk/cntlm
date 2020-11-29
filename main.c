@@ -104,6 +104,7 @@ hlist_t header_list = NULL;			/* forward_request() */
 hlist_t users_list = NULL;			/* socks5_thread() */
 plist_t scanner_agent_list = NULL;		/* scanner_hook() */
 plist_t noproxy_list = NULL;			/* proxy_thread() */
+plist_t allowedhosts_list = NULL;
 
 /*
  * General signal handler. If in debug mode, quit immediately.
@@ -271,21 +272,52 @@ void tunnel_add(plist_t *list, char *spec, int gateway) {
 }
 
 /*
- * Add no-proxy hostname/IP
+ * Add hostname/IP to list of hostnames
+ * Used for allowedhosts and for no-proxy lists
  */
-plist_t noproxy_add(plist_t list, char *spec) {
+plist_t list_add(plist_t list, char *spec) {
 	char *tok, *save;
 
 	tok = strtok_r(spec, ", ", &save);
 	while ( tok != NULL ) {
 		if (debug)
-			printf("Adding no-proxy for: '%s'\n", tok);
+			printf("Adding list entry for: '%s'\n", tok);
 		list = plist_add(list, 0, strdup(tok));
 		tok = strtok_r(NULL, ", ", &save);
 	}
 
 	return list;
 }
+
+/*
+* Check if a host is allowed to use this proxy.
+* If no allow entries are specified, defaults to everybody.
+*/
+int allowedhosts_match(const char *addr) {
+	plist_t list;
+
+	list = allowedhosts_list;
+	
+	if(list->next == (void*)-1) {
+		printf("AllowedHosts is empty. Everything is allowed");
+		return 1;
+	}
+
+	while (list) {
+		if (list->aux && strlen(list->aux)
+				&& fnmatch(list->aux, addr, 0) == 0) {
+			if (debug)
+				printf("  ALLOWED HOST: %s (%s)\n", addr, (char *)list->aux);
+			return 1;
+		} else if (debug)
+			printf("  NOT ALLOWED HOST: %s (%s)\n", addr, (char *)list->aux);
+
+		list = list->next;
+	}
+
+	return 0;
+}
+
 
 int noproxy_match(const char *addr) {
 	plist_t list;
@@ -307,11 +339,15 @@ int noproxy_match(const char *addr) {
 }
 
 /*
- * Proxy thread - decide between direct and forward based on NoProxy
+ * Proxy thread 
+ * - reject requests that are not allowed via AllowedHosts.
+ * - decide between direct and forward based on NoProxy
  */
 void *proxy_thread(void *thread_data) {
 	rr_data_t request, ret;
 	int keep_alive;				/* Proxy-Connection */
+	int w;
+	char *tmp;
 
 	int cd = ((struct thread_arg_s *)thread_data)->fd;
 
@@ -326,6 +362,16 @@ void *proxy_thread(void *thread_data) {
 
 		request = new_rr_data();
 		if (!headers_recv(cd, request)) {
+			free_rr_data(request);
+			break;
+		}
+
+		
+		if (!allowedhosts_match(request->hostname)) {
+			syslog(LOG_WARNING, "Host has no AllowedHosts entry:  %s:%d", request->hostname, request->port);
+		    tmp = gen_502_page(request->http, strerror(errno));
+		    w = write(cd, tmp, strlen(tmp));
+		    free(tmp);
 			free_rr_data(request);
 			break;
 		}
@@ -711,7 +757,7 @@ int main(int argc, char **argv) {
 	syslog(LOG_INFO, "Starting cntlm version " VERSION " for LITTLE endian\n");
 #endif
 
-	while ((i = getopt(argc, argv, ":-:a:c:d:fghIl:p:r:su:vw:A:BD:F:G:HL:M:N:O:P:R:S:T:U:")) != -1) {
+	while ((i = getopt(argc, argv, ":-:a:c:d:fghIl:p:r:su:vw:A:BD:F:G:HL:M:N:O:P:R:S:T:U:W:")) != -1) {
 		switch (i) {
 			case 'A':
 			case 'D':
@@ -776,9 +822,13 @@ int main(int argc, char **argv) {
 				magic_detect = strdup(optarg);
 				break;
 			case 'N':
-				noproxy_list = noproxy_add(noproxy_list, tmp=strdup(optarg));
+				noproxy_list = list_add(noproxy_list, tmp=strdup(optarg));
 				free(tmp);
-				break;
+				break;		
+			case 'W':
+				allowedhosts_list = list_add(allowedhosts_list, tmp=strdup(optarg));
+				free(tmp);
+				break;						
 			case 'O':
 				listen_add("SOCKS5 proxy", &socksd_list, optarg, gateway);
 				break;
@@ -911,6 +961,9 @@ int main(int argc, char **argv) {
 				"\t    Magic autodetection of proxy's NTLM dialect.\n");
 		fprintf(stderr, "\t-N  \"<hostname_wildcard1>[, <hostname_wildcardN>\"\n"
 				"\t    List of URL's to serve direcly as stand-alone proxy (e.g. '*.local')\n");
+		fprintf(stderr, "\t-W  \"<hostname_wildcard1>[, <hostname_wildcardN>\"\n"
+				"\t    List of target URL's for which this proxy is allowed. (e.g. '*.local')\n"			
+				"\t    The proxy will refuse operation for other targets. Not specifying this will allow everything.\n");								
 		fprintf(stderr, "\t-O  [<saddr>:]<lport>\n"
 				"\t    Enable SOCKS5 proxy on port lport (binding to address saddr)\n");
 		fprintf(stderr, "\t-P  <pidfile>\n"
@@ -1088,10 +1141,17 @@ int main(int argc, char **argv) {
 
 		while ((tmp = config_pop(cf, "NoProxy"))) {
 			if (strlen(tmp)) {
-				noproxy_list = noproxy_add(noproxy_list, tmp);
+				noproxy_list = list_add(noproxy_list, tmp);
 			}
 			free(tmp);
 		}
+		while ((tmp = config_pop(cf, "AllowedHosts"))) {
+			if (strlen(tmp)) {
+				allowedhosts_list = list_add(allowedhosts_list, tmp);
+			}
+			free(tmp);
+		}
+
 
 		while ((tmp = config_pop(cf, "SOCKS5Users"))) {
 			head = strchr(tmp, ':');
@@ -1601,6 +1661,7 @@ bailout:
 	hlist_free(header_list);
 	plist_free(scanner_agent_list);
 	plist_free(noproxy_list);
+	plist_free(allowedhosts_list);
 	plist_free(tunneld_list);
 	plist_free(proxyd_list);
 	plist_free(socksd_list);

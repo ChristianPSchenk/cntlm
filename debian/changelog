@@ -1,3 +1,7 @@
+cntlm (0.92.3-BOSCH) 
+
+  * Added capability to provide a list of hosts / host patterns for which the proxy will work
+
 cntlm (0.92.3) unstable; urgency=low
 
   * Ad-hoc source build, not a Debian maintained package!
